@@ -326,11 +326,14 @@ def mc_inference(
 
         brain_nets = batch.get('brain_nets', None)
         vp_counts = batch.get('valid_patch_counts', None)
+        vp_mask = batch.get('valid_patch_mask', None)
         rel_time = batch.get('rel_time', None)
         if brain_nets is not None:
             brain_nets = brain_nets.to(device)
         if vp_counts is not None:
             vp_counts = vp_counts.to(device)
+        if vp_mask is not None:
+            vp_mask = vp_mask.to(device)
         if rel_time is not None:
             rel_time = rel_time.to(device)
 
@@ -345,6 +348,7 @@ def mc_inference(
                 out = model(
                     x, onset, start,
                     valid_patch_counts=vp_counts,
+                    valid_patch_mask=vp_mask,
                     brain_networks=brain_nets,
                     rel_time=rel_time,
                 )
