@@ -921,4 +921,451 @@ def main():
             gaussian_prob=args.augment_gaussian_prob,
             gaussian_std_scale=args.augment_gaussian_std_scale,
             bandstop_prob=args.augment_bandstop_prob,
-            
+            bandstop_min_freq=args.augment_bandstop_min_freq,
+            bandstop_max_freq=args.augment_bandstop_max_freq,
+            bandstop_width_hz=args.augment_bandstop_width_hz,
+            channel_dropout_prob=args.augment_channel_drop_prob,
+            max_channel_drops=args.augment_max_channel_drops,
+            time_mask_prob=args.augment_time_mask_prob,
+            time_mask_max_ratio=args.augment_time_mask_max_ratio,
+            amplitude_scale_prob=args.augment_amplitude_scale_prob,
+            amplitude_scale_min=args.augment_amplitude_scale_min,
+            amplitude_scale_max=args.augment_amplitude_scale_max,
+            freq_shift_prob=args.augment_freq_shift_prob,
+            freq_shift_max_hz=args.augment_freq_shift_max_hz,
+            time_shift_prob=args.augment_time_shift_prob,
+            time_shift_max_samples=args.augment_time_shift_max_samples,
+        )
+        if args.augment_minority_oversample > 0.0:
+            minority_oversampler = MinorityClassOversampler(
+                n_segments=args.augment_sr_segments,
+                oversample_ratio=args.augment_minority_oversample,
+                region_negative_threshold=args.augment_minority_region_threshold,
+                augmentor=train_augmentor,
+            )
+        log.info("  EEG augmentation enabled")
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, sampler=train_sampler,
+        num_workers=args.workers, collate_fn=collate_fn, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, collate_fn=collate_fn,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, collate_fn=collate_fn,
+    )
+
+    # ── 2. Model init ──
+    log.info("=== Step 2: Initializing model ===")
+    region_names = tuple(split_meta.get('region_names', get_region_names(args.region_label_mode)))
+    n_hemisphere_classes = 2 if split_meta.get('hemisphere_label_mode') == 'lr_ignore_b' else 3
+
+    cfg = IntegrationConfig(
+        task_mode='soz',
+        embed_dim=args.embed_dim,
+        out_chans=args.out_chans,
+        n_transformer_layers=args.n_transformer_layers,
+        n_heads_transformer=args.n_heads,
+        ff_mult=args.ff_mult,
+        transformer_dropout=args.transformer_dropout,
+        tf_alpha=args.tf_alpha,
+        tf_n_heads=args.tf_n_heads,
+        top_p=args.top_p,
+        n_timefilter_blocks=args.n_timefilter_blocks,
+        temporal_k=args.temporal_k,
+        gat_dropout=args.gat_dropout,
+        patch_len=patch_len,
+        n_pre_patches=n_pre_patches,
+        n_post_patches=n_post_patches,
+        fs=args.fs,
+        output_mode=args.output_mode,
+        n_regions=len(region_names),
+        region_label_mode=args.region_label_mode,
+        n_hemisphere_classes=n_hemisphere_classes,
+        brain_network_features=selected_brain_features,
+        gc_order=args.gc_order,
+        te_n_bins=args.te_n_bins,
+        brain_tf_n_blocks=args.brain_tf_n_blocks,
+        brain_tf_n_heads=args.brain_tf_n_heads,
+        brain_tf_hidden=args.brain_tf_hidden,
+        gru_hidden=args.gru_hidden,
+        gru_layers=args.gru_layers,
+        gcn_hidden=args.gcn_hidden,
+        fusion_dropout=args.fusion_dropout,
+        w_transition=args.w_transition,
+        w_pattern=args.w_pattern,
+        w_moe=args.w_moe,
+        w_region=args.w_region,
+        w_hemisphere=args.w_hemisphere,
+        w_map_pos=args.w_map_pos,
+        w_map_neg=args.w_map_neg,
+        w_map_margin=args.w_map_margin,
+        map_margin=args.map_margin,
+        task_training_mode=args.task_training_mode,
+        focal_gamma=args.focal_gamma,
+        focal_alpha=args.focal_alpha,
+        use_checkpoint=args.use_checkpoint,
+    )
+    model = Lightweight_Transformer_BrainNetwork_Integration(cfg).to(device)
+    log.info(model.summary())
+
+    if stage_pretrain_path is not None:
+        load_info = model.load_backbone_weights(str(stage_pretrain_path), map_location=device)
+        log.info(
+            "  Loaded stage-1 Transformer backbone: loaded=%d missing=%d unexpected=%d from %s",
+            len(load_info['loaded_keys']),
+            len(load_info['missing_keys']),
+            len(load_info['unexpected_keys']),
+            stage_pretrain_path,
+        )
+        if load_info['unexpected_keys']:
+            log.warning(
+                "  Stage-1 backbone keys skipped because of shape/name mismatch: %s",
+                load_info['unexpected_keys'][:20],
+            )
+
+    # Load init checkpoint if provided
+    if args.init_ckpt:
+        init_path = Path(args.init_ckpt)
+        if not init_path.exists():
+            raise FileNotFoundError(f"Init checkpoint not found: {init_path}")
+        load_info = load_compatible_model_weights(model, str(init_path), map_location=device)
+        log.info(
+            "  Loaded init checkpoint: loaded=%d missing=%d unexpected=%d",
+            len(load_info['loaded_keys']),
+            len(load_info['missing_keys']),
+            len(load_info['unexpected_keys']),
+        )
+
+    # Set pos_weight
+    log.info("  Computing pos_weight ...")
+    if train_analysis is not None:
+        pw = compute_pos_weight_from_analysis(train_analysis, device=device)
+    else:
+        pw = compute_pos_weight(train_loader, device=device)
+    model.set_pos_weight(pw)
+
+    if args.private_channel_loss_weight:
+        channel_weight, channel_summary = build_private_channel_weight(
+            train_analysis,
+            min_weight=args.private_common_channel_loss_min_weight,
+            max_weight=args.private_rare_channel_loss_max_weight,
+            zero_positive_weight=args.private_zero_positive_channel_weight,
+            device=device,
+        )
+        if channel_weight is not None:
+            model.set_channel_weight(channel_weight)
+            log.info("  Private channel loss weighting enabled")
+
+    # ── 3. Training ──
+    log.info("=== Step 3: Training ===")
+    writer = SummaryWriter(str(output_dir / 'tb')) if (_HAS_TB and is_main(rank)) else None
+    scaler = torch.amp.GradScaler('cuda') if args.amp else None
+
+    if world > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    base_model = model.module if hasattr(model, 'module') else model
+
+    # Resume
+    start_epoch = 0
+    best_selection_key = (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device)
+        base_model.load_state_dict(resume_ckpt['model_state'])
+        start_epoch = resume_ckpt.get('epoch', 0) + 1
+        raw_key = resume_ckpt.get('best_selection_key', None)
+        if raw_key is not None:
+            best_selection_key = tuple(float(x) for x in raw_key)
+            if len(best_selection_key) < 6:
+                best_selection_key = best_selection_key + (-1.0,) * (6 - len(best_selection_key))
+        log.info("  Resumed from epoch %d", start_epoch)
+
+    total_epochs = args.epochs
+
+    # All params trainable from start — no frozen backbone phases
+    optimizer = torch.optim.AdamW(
+        base_model.get_param_groups(args.lr), weight_decay=args.weight_decay,
+    )
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=total_epochs,
+    )
+    if resume_ckpt is not None:
+        if 'optimizer_state' in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt['optimizer_state'])
+            log.info("  Optimizer state restored")
+        else:
+            log.warning("  Resume checkpoint has no optimizer_state; optimizer starts fresh")
+
+        if 'scheduler_state' in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt['scheduler_state'])
+            log.info("  Scheduler state restored")
+        else:
+            log.warning("  Resume checkpoint has no scheduler_state; advancing scheduler by epoch")
+            for _ in range(start_epoch):
+                scheduler.step()
+
+        if scaler is not None and 'scaler_state' in resume_ckpt:
+            scaler.load_state_dict(resume_ckpt['scaler_state'])
+            log.info("  AMP scaler state restored")
+
+    def _training_state_extra(epoch_idx: int) -> Dict[str, object]:
+        extra: Dict[str, object] = {
+            'epoch': epoch_idx,
+            'best_selection_key': list(best_selection_key),
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+        }
+        if scaler is not None:
+            extra['scaler_state'] = scaler.state_dict()
+        return extra
+
+    for epoch in range(start_epoch, total_epochs):
+        if world > 1:
+            train_sampler.set_epoch(epoch)
+
+        t0 = time.time()
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, scaler, device, epoch, cfg, writer,
+            generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+            generalized_sample_weight=args.generalized_sample_weight,
+            train_augmentor=train_augmentor,
+            lr_mirror_prob=train_lr_mirror_prob,
+            minority_oversampler=minority_oversampler,
+        )
+        scheduler.step()
+        dt = time.time() - t0
+
+        val_metrics = evaluate(
+            model, val_loader, device,
+            generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+            generalized_sample_weight=args.generalized_sample_weight,
+            collect_sample_info=True,
+        )
+
+        # DeepSOZ SOZ metrics (lightweight per-epoch)
+        soz_deepsoz: Dict[str, float] = {}
+        if is_main(rank) and 'patient_ids' in val_metrics:
+            try:
+                soz_deepsoz = compute_deepsoz_soz_metrics(
+                    probs=val_metrics['probs'],
+                    targets=val_metrics['targets'],
+                    patient_ids=val_metrics['patient_ids'],
+                    edf_paths=val_metrics['edf_paths'],
+                    neighbour_threshold=args.neighbour_threshold,
+                )
+            except Exception as exc:
+                log.warning("DeepSOZ SOZ metrics failed at epoch %d: %s", epoch + 1, exc)
+
+        if is_main(rank):
+            current_lr = optimizer.param_groups[-1]['lr']
+            log.info(
+                f"Epoch {epoch:3d}/{total_epochs} "
+                f"loss={train_metrics['loss']:.4f} "
+                f"train_r3={train_metrics['recall_at_3']:.3f} "
+                f"train_ndcg3={train_metrics['ndcg_at_3']:.3f} "
+                f"val_r3={val_metrics['recall_at_3']:.3f} "
+                f"val_ndcg3={val_metrics['ndcg_at_3']:.3f} "
+                f"val_auc={val_metrics['auc']:.3f} "
+                f"val_region={val_metrics['region_acc']:.3f} "
+                f"val_hemi={val_metrics['hemisphere_acc']:.3f} "
+                f"lr={current_lr:.2e} ({dt:.1f}s)"
+            )
+            if writer:
+                writer.add_scalar('val/recall_at_3', val_metrics['recall_at_3'], epoch)
+                writer.add_scalar('val/ndcg_at_3', val_metrics['ndcg_at_3'], epoch)
+                writer.add_scalar('val/mrr', val_metrics['mrr'], epoch)
+                writer.add_scalar('val/auc', val_metrics['auc'], epoch)
+                writer.add_scalar('val/region_acc', val_metrics['region_acc'], epoch)
+                writer.add_scalar('val/hemisphere_acc', val_metrics['hemisphere_acc'], epoch)
+                writer.add_scalar('lr', current_lr, epoch)
+                if soz_deepsoz:
+                    for dkey, dval in soz_deepsoz.items():
+                        if isinstance(dval, (int, float)):
+                            writer.add_scalar(f'val_deepsoz_soz/{dkey}', dval, epoch)
+
+            if soz_deepsoz:
+                log.info(
+                    "  [soz deepsoz] corr_sz=%.3f acc_pt_w=%.3f acc_pt_s=%.3f",
+                    soz_deepsoz.get('corr_sz', 0.0),
+                    soz_deepsoz.get('acc_pt_weighted', 0.0),
+                    soz_deepsoz.get('acc_pt_strict', 0.0),
+                )
+
+            # Save best
+            val_selection_key = build_selection_key(val_metrics, args.task_training_mode)
+            if val_selection_key > best_selection_key:
+                best_selection_key = val_selection_key
+                val_summary = {
+                    key: value for key, value in val_metrics.items()
+                    if not isinstance(value, np.ndarray)
+                }
+                base_model.save_checkpoint(
+                    str(output_dir / 'best_model.pt'),
+                    extra={
+                        'epoch': epoch,
+                        'best_selection_key': list(best_selection_key),
+                        'val_metrics': val_summary,
+                        'deepsoz_soz_metrics': soz_deepsoz,
+                    },
+                )
+                log.info(
+                    "  ** New best: %s",
+                    format_selection_key_text(best_selection_key, args.task_training_mode),
+                )
+
+            if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+                base_model.save_checkpoint(
+                    str(output_dir / f'ckpt_epoch{epoch:03d}.pt'),
+                    extra=_training_state_extra(epoch),
+                )
+
+    # ── 4. Test evaluation ──
+    log.info("=== Step 4: Test evaluation ===")
+    best_path = output_dir / 'best_model.pt'
+    if best_path.exists():
+        ckpt_best = torch.load(str(best_path), map_location=device)
+        base_model.load_state_dict(ckpt_best['model_state'])
+
+    val_metrics_best = evaluate(
+        model, val_loader, device,
+        generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+        generalized_sample_weight=args.generalized_sample_weight,
+    )
+    test_metrics = evaluate(
+        model, test_loader, device,
+        generalized_pos_ratio_threshold=args.generalized_pos_ratio_threshold,
+        generalized_sample_weight=args.generalized_sample_weight,
+        collect_sample_info=True,
+    )
+
+    # MC dropout DeepSOZ SOZ evaluation
+    mc_soz_results: Dict[str, object] = {}
+    if is_main(rank):
+        log.info(
+            "Running MC dropout SOZ evaluation (mc_samples=%d) ...",
+            args.mc_samples,
+        )
+        try:
+            mc_soz_results = run_detailed_soz_evaluation(
+                model, test_loader, device,
+                mc_samples=args.mc_samples,
+                neighbour_threshold=args.neighbour_threshold,
+                output_dir=str(output_dir),
+            )
+            mc_m = mc_soz_results.get('metrics', {})
+            log.info(
+                "  [MC soz] corr_sz=%.3f acc_pt_w=%.3f acc_pt_s=%.3f",
+                mc_m.get('corr_sz', 0.0),
+                mc_m.get('acc_pt_weighted', 0.0),
+                mc_m.get('acc_pt_strict', 0.0),
+            )
+        except Exception as exc:
+            log.warning("MC dropout SOZ evaluation failed: %s", exc)
+
+    if is_main(rank):
+        log.info(
+            f"\nTest results:\n"
+            f"  Recall@1: {test_metrics['recall_at_1']:.4f}\n"
+            f"  Recall@3: {test_metrics['recall_at_3']:.4f}\n"
+            f"  Recall@5: {test_metrics['recall_at_5']:.4f}\n"
+            f"  nDCG@3:   {test_metrics['ndcg_at_3']:.4f}\n"
+            f"  MRR:      {test_metrics['mrr']:.4f}\n"
+            f"  AUC:      {test_metrics['auc']:.4f}\n"
+            f"  Region:   {test_metrics['region_acc']:.4f}\n"
+            f"  Hemi:     {test_metrics['hemisphere_acc']:.4f}"
+        )
+
+        # Report
+        report = (
+            f"# SOZ Localization Report (Lightweight Transformer v2)\n\n"
+            f"## Model\n"
+            f"- Backbone: {args.n_transformer_layers}-layer Transformer "
+            f"(embed_dim={args.embed_dim}, heads={args.n_heads})\n"
+            f"- TimeFilter: blocks={args.n_timefilter_blocks}, heads={args.tf_n_heads}, "
+            f"alpha={args.tf_alpha}, top_p={args.top_p}, temporal_k={args.temporal_k}\n"
+            f"- Brain-network features: {','.join(selected_brain_features)}\n"
+            f"- No pretrained LaBraM weights\n"
+            f"- Stage-1 Transformer init: {str(stage_pretrain_path) if stage_pretrain_path else 'none'}\n"
+            f"- Training mode: {args.task_training_mode}\n"
+            f"- Epochs: {total_epochs}\n"
+            f"- Output mode: {args.output_mode}\n"
+            f"- Region label mode: {args.region_label_mode}\n\n"
+            f"## Test Metrics\n\n"
+            f"| Metric | Value |\n|--------|-------|\n"
+            f"| Recall@1 | {test_metrics['recall_at_1']:.4f} |\n"
+            f"| Recall@3 | {test_metrics['recall_at_3']:.4f} |\n"
+            f"| Recall@5 | {test_metrics['recall_at_5']:.4f} |\n"
+            f"| nDCG@3 | {test_metrics['ndcg_at_3']:.4f} |\n"
+            f"| MRR | {test_metrics['mrr']:.4f} |\n"
+            f"| AUC | {test_metrics['auc']:.4f} |\n"
+            f"| Region acc | {test_metrics['region_acc']:.4f} |\n"
+            f"| Hemisphere acc | {test_metrics['hemisphere_acc']:.4f} |\n\n"
+            f"## Best validation key\n"
+            f"{format_selection_key_text(best_selection_key, args.task_training_mode)}\n"
+        )
+        if mc_soz_results and 'metrics' in mc_soz_results:
+            mc_m = mc_soz_results['metrics']
+            report += (
+                f"\n## DeepSOZ SOZ (MC dropout, N={args.mc_samples})\n\n"
+                f"| Metric | Value |\n|--------|-------|\n"
+                f"| corr_sz | {mc_m.get('corr_sz', 0.0):.4f} |\n"
+                f"| acc_pt (weighted) | {mc_m.get('acc_pt_weighted', 0.0):.4f} |\n"
+                f"| acc_pt (strict) | {mc_m.get('acc_pt_strict', 0.0):.4f} |\n"
+                f"| acc_pt (lenient) | {mc_m.get('acc_pt_lenient', 0.0):.4f} |\n"
+            )
+        (output_dir / 'report.md').write_text(report, encoding='utf-8')
+        log.info("Report saved to %s", output_dir / 'report.md')
+
+        # Save predictions
+        np.savez(
+            str(output_dir / 'val_predictions.npz'),
+            probs=val_metrics_best['probs'],
+            targets=val_metrics_best['targets'],
+            region_probs=val_metrics_best['region_probs'],
+            region_targets=val_metrics_best['region_targets'],
+            region_names=np.asarray(region_names),
+            hemisphere_logits=val_metrics_best['hemisphere_logits'],
+            hemisphere_targets=val_metrics_best['hemisphere_targets'],
+            valid_patch_counts=val_metrics_best['valid_patch_counts'],
+            valid_patch_mask=val_metrics_best['valid_patch_mask'],
+            seizure_relative_time=val_metrics_best['seizure_relative_time'],
+        )
+        np.savez(
+            str(output_dir / 'test_predictions.npz'),
+            probs=test_metrics['probs'],
+            targets=test_metrics['targets'],
+            region_probs=test_metrics['region_probs'],
+            region_targets=test_metrics['region_targets'],
+            region_names=np.asarray(region_names),
+            hemisphere_logits=test_metrics['hemisphere_logits'],
+            hemisphere_targets=test_metrics['hemisphere_targets'],
+            valid_patch_counts=test_metrics['valid_patch_counts'],
+            valid_patch_mask=test_metrics['valid_patch_mask'],
+            seizure_relative_time=test_metrics['seizure_relative_time'],
+        )
+        save_region_confusion_report(
+            region_probs=test_metrics['region_probs'],
+            region_targets=test_metrics['region_targets'],
+            output_dir=output_dir,
+            threshold=0.5,
+            region_names=region_names,
+        )
+
+    if writer:
+        writer.close()
+    if world > 1:
+        dist.destroy_process_group()
+
+    log.info("Done.")
+    return 0
+
+
+if __name__ == '__main__':
+    warnings.filterwarnings('ignore', category=UserWarning)
+    sys.exit(main())
