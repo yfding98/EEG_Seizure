@@ -628,38 +628,6 @@ class EEGWindowAugmentor:
             if torch.rand(1, device=x.device).item() >= self.channel_dropout_prob:
                 continue
 
-            if bipolar_labelected.numel() == 0:
-            return x
-
-        n_time = x.size(-1)
-        freqs = torch.fft.rfftfreq(n_time, d=1.0 / self.fs).to(x.device)
-        transformed = torch.fft.rfft(x[selected], dim=-1)
-        half_width = self.bandstop_width_hz / 2.0
-        for local_idx in range(selected.numel()):
-            center = torch.empty(1, device=x.device).uniform_(
-                self.bandstop_min_freq,
-                self.bandstop_max_freq,
-            ).item()
-            keep_mask = ((freqs < center - half_width) | (freqs > center + half_width)).to(transformed.dtype)
-            transformed[local_idx] = transformed[local_idx] * keep_mask.view(1, -1)
-        x = x.clone()
-        x[selected] = torch.fft.irfft(transformed, n=n_time, dim=-1)
-        return x
-
-    def _channel_dropout(
-        self,
-        x: torch.Tensor,
-        bipolar_label: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self.channel_dropout_prob <= 0.0 or self.max_channel_drops <= 0:
-            return x
-
-        x = x.clone()
-        n_channels = x.size(1)
-        for batch_idx in range(x.size(0)):
-            if torch.rand(1, device=x.device).item() >= self.channel_dropout_prob:
-                continue
-
             if bipolar_label is not None:
                 positive = torch.nonzero(bipolar_label[batch_idx] > 0.5, as_tuple=False).flatten()
             else:

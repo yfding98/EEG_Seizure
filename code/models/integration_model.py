@@ -894,4 +894,517 @@ class TimeFilter_LaBraM_BrainNetwork_Integration(nn.Module):
             brain_nets = brain_networks
         brain_nets = brain_nets * self.brain_feature_mask.to(
             device=brain_nets.device,
-            dtyp
+            dtype=brain_nets.dtype,
+        )
+        brain_nets = brain_nets * valid_patch_mask.to(
+            device=brain_nets.device,
+            dtype=brain_nets.dtype,
+        )[:, :, None, None, None]
+
+        # 有向图过滤
+        brain_nets_filtered, moe_loss_b = self.brain_timefilter(
+            brain_nets,
+            is_training=self.training,
+            valid_patch_mask=valid_patch_mask,
+        )  # [B, P, 22, 22, 4], scalar
+        brain_nets_filtered = brain_nets_filtered * valid_patch_mask.to(
+            device=brain_nets_filtered.device,
+            dtype=brain_nets_filtered.dtype,
+        )[:, :, None, None, None]
+
+        evo_out = self.net_evolution(
+            brain_nets_filtered,
+            vp_counts,
+            rel_time,
+            valid_patch_mask=valid_patch_mask,
+        )
+        network_feat = evo_out['network_features']            # [B, 256]
+        transition_probs = evo_out['transition_probs']        # [B, P]
+        transition_logits = evo_out['transition_logits']      # [B, P]
+        pattern_logits = evo_out['pattern_logits']            # [B, 3]
+        branch_weights = evo_out['branch_weights']            # [B, P, 4]
+
+        # ── Step 3: Gated fusion ──
+        fused, gate_w = self.fusion(temporal_feat, network_feat)
+        # fused: [B, N, D],  gate_w: [B, N]
+
+        # ── Step 4: SOZ localization ──
+        soz_logits, bipolar_logits = self.soz_head(
+            fused,
+            patch_valid_mask=valid_patch_mask,
+        )                                                     # [B, 19], [B, 22]
+        soz_probs = torch.sigmoid(soz_logits)
+        # DeepSOZ-style aggregation from channel logits
+        region_logits = self.region_agg(soz_logits)           # [B, n_regions]
+        hemisphere_logits = self.hemi_agg(soz_logits)         # [B, 3]
+
+        # MoE辅助损失合并
+        moe_loss = moe_loss_a + moe_loss_b
+
+        outputs = {
+            'soz_probs': soz_probs,
+            'soz_logits': soz_logits,
+            'bipolar_logits': bipolar_logits,
+            'region_logits': region_logits,
+            'region_probs': torch.sigmoid(region_logits),
+            'hemisphere_logits': hemisphere_logits,
+            'hemisphere_probs': torch.softmax(hemisphere_logits, dim=-1),
+            'transition_probs': transition_probs,
+            'transition_logits': transition_logits,
+            'pattern_logits': pattern_logits,
+            'gate_weights': gate_w,
+            'brain_networks': brain_nets.detach(),
+            'brain_networks_filtered': brain_nets_filtered.detach(),
+            'branch_weights': branch_weights,
+            'valid_patch_counts': vp_counts,
+            'valid_patch_mask': valid_patch_mask,
+            'seizure_relative_time': rel_time,
+            'moe_loss': moe_loss,
+        }
+        self._last = {k: (v.detach() if isinstance(v, torch.Tensor) else v)
+                      for k, v in outputs.items()}
+        return outputs
+
+    # -----------------------------------------------------------------
+    # Multi-task loss
+    # -----------------------------------------------------------------
+
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        soz_targets: torch.Tensor,
+        region_targets: Optional[torch.Tensor] = None,
+        hemisphere_targets: Optional[torch.Tensor] = None,
+        transition_targets: Optional[torch.Tensor] = None,
+        pattern_targets: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args
+        ----
+        soz_targets        : [B, 19] or [B, 22]
+        region_targets     : [B, n_regions]  (optional, multi-label)
+        hemisphere_targets : [B]     (optional, 0=L,1=R,2=B,-100=ignore)
+        transition_targets : [B, P]  (optional)
+        pattern_targets    : [B]     (optional)
+
+        Returns: total_loss, loss_dict
+        """
+        c = self.cfg
+        mode = str(getattr(c, 'task_training_mode', 'multitask')).strip().lower()
+        if mode not in {'multitask', 'soz_only', 'region_only', 'hemisphere_only'}:
+            raise ValueError(f"Unsupported task_training_mode: {mode}")
+
+        zero = outputs['soz_logits'].new_zeros(())
+        losses = {
+            'soz': zero,
+            'map_pos': zero,
+            'map_neg': zero,
+            'map_margin': zero,
+            'region': zero,
+            'hemisphere': zero,
+            'transition': zero,
+            'pattern': zero,
+            'moe': zero,
+        }
+        total = zero
+
+        if mode in {'multitask', 'soz_only'}:
+            losses['soz'] = self.focal_loss(
+                outputs['soz_logits'], soz_targets, sample_weight=sample_weight
+            )
+            total = total + losses['soz']
+
+            # DeepSOZ-style Map losses on channel probabilities
+            soz_probs = torch.sigmoid(outputs['soz_logits'])
+            losses['map_pos'] = self.map_loss_pos(soz_probs, soz_targets)
+            losses['map_neg'] = self.map_loss_neg(soz_probs, soz_targets)
+            losses['map_margin'] = self.map_loss_margin(soz_probs, soz_targets)
+            total = total + c.w_map_pos * losses['map_pos']
+            total = total + c.w_map_neg * losses['map_neg']
+            total = total + c.w_map_margin * losses['map_margin']
+
+        if mode in {'multitask', 'region_only'} and region_targets is not None:
+            region_loss = F.binary_cross_entropy_with_logits(
+                outputs['region_logits'],
+                region_targets,
+                reduction='none',
+            )
+            if sample_weight is not None:
+                region_loss = region_loss * sample_weight.unsqueeze(1)
+            losses['region'] = region_loss.mean()
+            total = total + (c.w_region * losses['region'] if mode == 'multitask' else losses['region'])
+
+        if mode in {'multitask', 'hemisphere_only'} and hemisphere_targets is not None:
+            valid_hemisphere = hemisphere_targets != -100
+            if valid_hemisphere.any():
+                hemisphere_loss = F.cross_entropy(
+                    outputs['hemisphere_logits'],
+                    hemisphere_targets,
+                    reduction='none',
+                    ignore_index=-100,
+                )
+                hemisphere_loss = hemisphere_loss[valid_hemisphere]
+                if sample_weight is not None:
+                    hemisphere_loss = hemisphere_loss * sample_weight[valid_hemisphere]
+                losses['hemisphere'] = hemisphere_loss.mean()
+                total = total + (
+                    c.w_hemisphere * losses['hemisphere'] if mode == 'multitask' else losses['hemisphere']
+                )
+
+        # auxiliary 1: transition detection
+        if mode == 'multitask' and transition_targets is not None:
+            tp = outputs['transition_logits']
+            transition_loss = F.binary_cross_entropy_with_logits(
+                tp, transition_targets, reduction='none',
+            )
+            if sample_weight is not None:
+                transition_loss = transition_loss * sample_weight.unsqueeze(1)
+            losses['transition'] = transition_loss.mean()
+            total = total + c.w_transition * losses['transition']
+
+        # auxiliary 2: pattern classification
+        if mode == 'multitask' and pattern_targets is not None:
+            pattern_loss = F.cross_entropy(
+                outputs['pattern_logits'], pattern_targets, reduction='none',
+            )
+            if sample_weight is not None:
+                pattern_loss = pattern_loss * sample_weight
+            losses['pattern'] = pattern_loss.mean()
+            total = total + c.w_pattern * losses['pattern']
+
+        # MoE auxiliary loss (both branches)
+        if mode == 'multitask' and 'moe_loss' in outputs:
+            losses['moe'] = outputs['moe_loss']
+            total = total + c.w_moe * outputs['moe_loss']
+
+        losses['total'] = total
+        return total, losses
+
+    def compute_stage_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        stage_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute patch-level seizure/non-seizure loss."""
+        losses: Dict[str, torch.Tensor] = {}
+        flat_targets = stage_targets.reshape(-1)
+        valid_mask = flat_targets != self.cfg.stage_ignore_index
+        if not valid_mask.any():
+            zero = outputs['stage_logits'].new_zeros(())
+            losses['stage'] = zero
+            losses['total'] = zero
+            return zero, losses
+
+        flat_logits = outputs['stage_logits'].reshape(-1, outputs['stage_logits'].size(-1))
+        losses['stage'] = self.stage_ce(flat_logits, flat_targets)
+        total = losses['stage']
+
+        if 'moe_loss' in outputs:
+            losses['moe'] = outputs['moe_loss']
+            total = total + self.cfg.w_moe * outputs['moe_loss']
+
+        losses['total'] = total
+        return total, losses
+
+    # -----------------------------------------------------------------
+    # Training phases
+    # -----------------------------------------------------------------
+
+    def freeze_backbone(self):
+        """Phase 1: freeze LaBraM backbone, train only heads."""
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def unfreeze_timefilter(self):
+        """Phase 2: unfreeze TimeFilter + network modules."""
+        for p in self.timefilter.parameters():
+            p.requires_grad = True
+        for p in self.brain_timefilter.parameters():
+            p.requires_grad = True
+        for p in self.net_evolution.parameters():
+            p.requires_grad = True
+
+    def unfreeze_all(self):
+        """Phase 3: unfreeze everything."""
+        for p in self.parameters():
+            p.requires_grad = True
+
+    def get_param_groups(self, lr: float = 1e-4) -> List[Dict]:
+        """Differential LR: backbone 0.1x, timefilter 0.5x, heads 1x."""
+        backbone_ids = set(id(p) for p in self.backbone.parameters())
+        tf_ids = set(id(p) for p in self.timefilter.parameters())
+        tf_ids |= set(id(p) for p in self.brain_timefilter.parameters())
+
+        backbone_params, tf_params, head_params = [], [], []
+        for p in self.parameters():
+            if not p.requires_grad:
+                continue
+            pid = id(p)
+            if pid in backbone_ids:
+                backbone_params.append(p)
+            elif pid in tf_ids:
+                tf_params.append(p)
+            else:
+                head_params.append(p)
+
+        return [
+            {'params': backbone_params, 'lr': lr * 0.1},
+            {'params': tf_params,       'lr': lr * 0.5},
+            {'params': head_params,     'lr': lr},
+        ]
+
+    # -----------------------------------------------------------------
+    # Checkpoint save / load
+    # -----------------------------------------------------------------
+
+    def save_checkpoint(self, path: str, extra: Dict = None):
+        ckpt = {'model_state': self.state_dict(), 'config': self.cfg}
+        if extra:
+            ckpt.update(extra)
+        torch.save(ckpt, path)
+
+    @classmethod
+    def load_checkpoint(cls, path: str, map_location='cpu'):
+        ckpt = torch.load(path, map_location=map_location)
+        cfg = ckpt['config']
+        if isinstance(cfg, dict):
+            cfg = IntegrationConfig(**cfg)
+        model = cls(cfg)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        if not isinstance(state, dict):
+            raise KeyError("Checkpoint does not contain a valid model state dict")
+
+        own_state = model.state_dict()
+        filtered_state: Dict[str, torch.Tensor] = {}
+        unexpected_keys: List[str] = []
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key not in own_state:
+                unexpected_keys.append(clean_key)
+                continue
+            if own_state[clean_key].shape != value.shape:
+                unexpected_keys.append(
+                    f"{clean_key} (ckpt={tuple(value.shape)} != model={tuple(own_state[clean_key].shape)})"
+                )
+                continue
+            filtered_state[clean_key] = value
+
+        missing_keys = [key for key in own_state.keys() if key not in filtered_state]
+        model.load_state_dict(filtered_state, strict=False)
+        log.info(
+            "Loaded checkpoint %s with compatible keys: loaded=%d missing=%d unexpected_or_mismatch=%d",
+            path,
+            len(filtered_state),
+            len(missing_keys),
+            len(unexpected_keys),
+        )
+        if missing_keys:
+            log.warning("Missing keys when loading checkpoint: %s", missing_keys[:20])
+        if unexpected_keys:
+            log.warning("Unexpected or mismatched keys in checkpoint: %s", unexpected_keys[:20])
+        return model, ckpt
+
+    def load_a_branch_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
+        """Load only backbone + timefilter weights from a checkpoint."""
+        ckpt = torch.load(path, map_location=map_location)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        branch_state = {}
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key.startswith('backbone.') or clean_key.startswith('timefilter.'):
+                branch_state[clean_key] = value
+        own_state = self.state_dict()
+        loaded_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        for key, value in branch_state.items():
+            if key not in own_state or own_state[key].shape != value.shape:
+                unexpected_keys.append(key)
+                continue
+            own_state[key].copy_(value)
+            loaded_keys.append(key)
+
+        missing_keys = [
+            key for key in own_state.keys()
+            if (key.startswith('backbone.') or key.startswith('timefilter.'))
+            and key not in branch_state
+        ]
+        return {
+            'loaded_keys': sorted(loaded_keys),
+            'missing_keys': sorted(missing_keys),
+            'unexpected_keys': sorted(unexpected_keys),
+        }
+
+    def load_backbone_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
+        """Load only LaBraM backbone weights from a checkpoint."""
+        ckpt = torch.load(path, map_location=map_location)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        backbone_state = {}
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key.startswith('backbone.'):
+                backbone_state[clean_key] = value
+
+        own_state = self.state_dict()
+        loaded_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        for key, value in backbone_state.items():
+            if key not in own_state or own_state[key].shape != value.shape:
+                unexpected_keys.append(key)
+                continue
+            own_state[key].copy_(value)
+            loaded_keys.append(key)
+
+        missing_keys = [
+            key for key in own_state.keys()
+            if key.startswith('backbone.') and key not in backbone_state
+        ]
+        return {
+            'loaded_keys': sorted(loaded_keys),
+            'missing_keys': sorted(missing_keys),
+            'unexpected_keys': sorted(unexpected_keys),
+        }
+
+    # -----------------------------------------------------------------
+    # Interpretability
+    # -----------------------------------------------------------------
+
+    def visualize_gate_weights(self, batch_idx: int = 0, save_path=None):
+        """Visualize gate weights showing temporal vs network contribution."""
+        import matplotlib.pyplot as plt
+        d = self._last
+        gw = d['gate_weights'][batch_idx].cpu().numpy()
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.plot(gw, 'o-', markersize=3)
+        ax.set_xlabel('Node index (channel x patch)')
+        ax.set_ylabel('Gate weight (1=temporal, 0=network)')
+        ax.set_title(f'Gate weights (sample {batch_idx})')
+        ax.axhline(0.5, color='gray', ls='--', alpha=0.5)
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150)
+        plt.show()
+        return fig
+
+    def highlight_soz_channels(self, batch_idx: int = 0, threshold: float = 0.5):
+        """Return predicted SOZ channels above threshold."""
+        from labram_timefilter_soz import STANDARD_19
+        probs = self._last['soz_probs'][batch_idx].cpu()
+        channels = []
+        for i, p in enumerate(probs):
+            if p > threshold:
+                name = STANDARD_19[i] if i < len(STANDARD_19) else f'ch{i}'
+                channels.append((name, p.item()))
+        channels.sort(key=lambda x: -x[1])
+        return channels
+
+    def summary(self) -> str:
+        n_total = sum(p.numel() for p in self.parameters())
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return (
+            f"TimeFilter_LaBraM_BrainNetwork_Integration\n"
+            f"  Task mode:        {self.cfg.task_mode}\n"
+            f"  Total params:     {n_total:,}\n"
+            f"  Trainable params: {n_train:,}\n"
+            f"  Output mode:      {self.cfg.output_mode}\n"
+            f"  Brain features:   {','.join(self.active_brain_network_features)}\n"
+            f"  Max patches:      {self.patching.max_patches}\n"
+        )
+
+
+# =====================================================================
+# Self-test
+# =====================================================================
+
+def _test():
+    torch.manual_seed(0)
+
+    cfg = IntegrationConfig(
+        labram_checkpoint='',
+        n_transformer_layers=2,
+        n_frozen_layers=0,
+        embed_dim=200,             # 对齐LaBraM-base
+        gru_hidden=64,
+        gcn_hidden=32,
+        n_pre_patches=4,
+        n_post_patches=6,
+        n_timefilter_blocks=1,
+        brain_tf_n_blocks=1,
+        brain_tf_hidden=32,
+        patch_len=200,
+    )
+    max_patches = cfg.n_pre_patches + cfg.n_post_patches  # 10
+
+    B, C, T = 2, 22, 2400  # 12 seconds @ 200 Hz
+    x = torch.randn(B, C, T)
+    onset = torch.tensor([105.0, 107.0])
+    start = torch.tensor([100.0, 100.0])
+
+    model = TimeFilter_LaBraM_BrainNetwork_Integration(cfg)
+    print(model.summary())
+
+    # forward
+    out = model(x, onset, start)
+
+    n_out = 19 if cfg.output_mode == 'monopolar' else 22
+    assert out['soz_probs'].shape == (B, n_out), \
+        f"soz_probs: expected [B,{n_out}], got {list(out['soz_probs'].shape)}"
+    assert out['region_logits'].shape == (B, cfg.n_regions)
+    assert out['hemisphere_logits'].shape == (B, cfg.n_hemisphere_classes)
+    assert out['transition_probs'].shape == (B, max_patches)
+    assert out['pattern_logits'].shape == (B, 3)
+    assert out['brain_networks'].shape == (B, max_patches, C, C, 4)
+    assert out['gate_weights'].shape[0] == B
+
+    print(f"soz_probs         : {list(out['soz_probs'].shape)}")
+    print(f"region_logits     : {list(out['region_logits'].shape)}")
+    print(f"hemisphere_logits : {list(out['hemisphere_logits'].shape)}")
+    print(f"transition_probs  : {list(out['transition_probs'].shape)}")
+    print(f"pattern_logits    : {list(out['pattern_logits'].shape)}")
+    print(f"gate_weights      : {list(out['gate_weights'].shape)}")
+    print(f"brain_networks    : {list(out['brain_networks'].shape)}")
+
+    # loss
+    soz_target = torch.zeros(B, n_out)
+    soz_target[:, 3] = 1.0   # simulate one SOZ channel
+    region_target = torch.zeros(B, cfg.n_regions)
+    region_target[:, 0] = 1.0
+    region_target[:, 3] = 1.0
+    hemisphere_target = torch.tensor([0, 2], dtype=torch.long)
+    vm = model.patching._valid_mask
+    if vm is None:
+        vm = torch.ones(B, max_patches, dtype=torch.bool)
+    aux_targets = DynamicNetworkEvolutionModel.compute_auxiliary_targets(
+        out['seizure_relative_time'], vm,
+    )
+    total, losses = model.compute_loss(
+        out, soz_target,
+        region_targets=region_target,
+        hemisphere_targets=hemisphere_target,
+        transition_targets=aux_targets['transition_targets'],
+        pattern_targets=aux_targets['pattern_targets'],
+    )
+    print(f"\nLosses: " + ", ".join(f"{k}={v:.4f}" for k, v in losses.items()))
+    total.backward()
+
+    n_grad = sum(1 for p in model.parameters()
+                 if p.requires_grad and p.grad is not None and p.grad.abs().sum() > 0)
+    n_req = sum(1 for p in model.parameters() if p.requires_grad)
+    print(f"Gradient: {n_grad}/{n_req} params have grad")
+
+    # freeze / unfreeze
+    model.freeze_backbone()
+    n_after = sum(1 for p in model.parameters() if p.requires_grad)
+    print(f"After freeze_backbone: {n_after}/{n_req} trainable")
+    model.unfreeze_all()
+
+    # param groups
+    groups = model.get_param_groups(lr=1e-4)
+    for i, g in enumerate(groups):
+        print(f"  group {i}: {len(g['params'])} params, lr={g['lr']}")
+
+    print("\n[PASS] All tests passed!")
+
+
+if __name__ == '__main__':
+    _test()
