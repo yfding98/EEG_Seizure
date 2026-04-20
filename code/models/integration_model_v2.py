@@ -326,17 +326,32 @@ class SOZHead(nn.Module):
         if output_mode == 'monopolar':
             self.b2m = BipolarToMonopolarMapper()
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        patch_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B, N, D]  where N = n_channels * n_patches
+        patch_valid_mask: optional [B, P] mask for seizure-aligned valid slots
         Returns: logits [B, n_output], bipolar_logits [B, 22]
         """
         B, N, D = x.shape
         P = N // self.n_channels
         x_4d = x.view(B, self.n_channels, P, D)              # [B, 22, P, D]
-        # max pool + mean pool over patches
-        max_p = x_4d.max(dim=2).values                        # [B, 22, D]
-        mean_p = x_4d.mean(dim=2)                             # [B, 22, D]
+        if patch_valid_mask is not None:
+            valid = patch_valid_mask.to(device=x.device, dtype=torch.bool)
+            valid_4d = valid[:, None, :, None]
+            masked_x = x_4d.masked_fill(~valid_4d, torch.finfo(x_4d.dtype).min)
+            max_p = masked_x.max(dim=2).values
+            has_valid = valid.any(dim=1).view(B, 1, 1)
+            max_p = torch.where(has_valid, max_p, torch.zeros_like(max_p))
+            denom = valid.sum(dim=1).clamp(min=1).to(dtype=x_4d.dtype).view(B, 1, 1)
+            mean_p = (x_4d * valid_4d.to(dtype=x_4d.dtype)).sum(dim=2) / denom
+        else:
+            # max pool + mean pool over patches
+            max_p = x_4d.max(dim=2).values                    # [B, 22, D]
+            mean_p = x_4d.mean(dim=2)                         # [B, 22, D]
         cat = torch.cat([max_p, mean_p], dim=-1)               # [B, 22, 2D]
         cat = self.pool_norm(cat)                               # normalize before MLP
         bipolar_logits = self.channel_fc(cat).squeeze(-1)      # [B, 22]
@@ -697,7 +712,7 @@ class LightweightTransformerBackbone(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_time_embed: bool = True) -> torch.Tensor:
         """
         Args:
             x: [B, n_channels, n_patches, patch_len]
@@ -710,12 +725,15 @@ class LightweightTransformerBackbone(nn.Module):
         x = self.patch_embed(x)            # [B, C*P, temporal_out_dim]
         x = self.embed_proj(x)             # [B, C*P, D]
 
-        # Add spatial + temporal positional encoding
+        # Add spatial positional encoding; temporal encoding can be disabled for
+        # patch-shuffled stage pretraining.
         pos = self.pos_embed[:, :C, :].unsqueeze(2).expand(B, C, P, -1)
         pos = pos.reshape(B, C * P, -1)
-        time = self.time_embed[:, :P, :].unsqueeze(1).expand(B, C, P, -1)
-        time = time.reshape(B, C * P, -1)
-        x = x + pos + time
+        x = x + pos
+        if use_time_embed:
+            time = self.time_embed[:, :P, :].unsqueeze(1).expand(B, C, P, -1)
+            time = time.reshape(B, C * P, -1)
+            x = x + time
         x = self.pos_drop(x)
 
         # Transformer
@@ -875,6 +893,34 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
             channel_weight=channel_weight,
         )
 
+    def set_stage_class_weight(self, class_weight: torch.Tensor):
+        """Set class weights for stage-pretraining FocalCrossEntropy loss."""
+        self.stage_ce = FocalCrossEntropyLoss(
+            gamma=self.cfg.focal_gamma,
+            weight=class_weight,
+            ignore_index=self.cfg.stage_ignore_index,
+        )
+
+    def configure_stage_pretraining(self, train_backbone: bool = True):
+        """
+        Enable only the modules used in stage pretraining.
+
+        Stage-1 optimizes the lightweight Transformer backbone and the
+        patch-level seizure/non-seizure head. TimeFilter, brain-network
+        modules, fusion, and SOZ heads remain frozen and are not called by
+        the stage-pretraining forward path.
+        """
+        for p in self.parameters():
+            p.requires_grad = False
+
+        if train_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = True
+            if hasattr(self.backbone, 'time_embed'):
+                self.backbone.time_embed.requires_grad = False
+        for p in self.stage_head.parameters():
+            p.requires_grad = True
+
     # -----------------------------------------------------------------
     # forward
     # -----------------------------------------------------------------
@@ -885,6 +931,7 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         seizure_onset_sec: Optional[torch.Tensor] = None,
         window_start_sec: Optional[torch.Tensor] = None,
         valid_patch_counts: Optional[torch.Tensor] = None,
+        valid_patch_mask: Optional[torch.Tensor] = None,
         brain_networks: Optional[torch.Tensor] = None,
         rel_time: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -894,7 +941,8 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         x                 : [B, 22, T]  raw EEG (200 Hz)
         seizure_onset_sec : [B]         absolute onset time (s)
         window_start_sec  : [B]         absolute window start (s)
-        valid_patch_counts: [B] (opt)   override patching counts
+        valid_patch_counts: [B] (opt)   legacy count override
+        valid_patch_mask  : [B, P] (opt) exact valid patch slots
         brain_networks    : [B, P, 22, 22, 4] (opt) precomputed brain networks
         rel_time          : [B, P] (opt) precomputed rel time
 
@@ -905,6 +953,55 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         c = self.cfg
         B = x.size(0)
 
+        if c.task_mode == 'stage_pretrain':
+            if x.dim() == 4:
+                patches = x.permute(0, 2, 1, 3)
+            elif x.dim() == 3:
+                expected = c.patch_len * (c.n_pre_patches + c.n_post_patches)
+                if x.size(-1) != expected:
+                    raise ValueError(
+                        f"Stage pretrain expects {expected} samples per window, got {x.size(-1)}"
+                    )
+                patches = x.view(B, c.n_channels, -1, c.patch_len).permute(0, 2, 1, 3)
+            else:
+                raise ValueError(f"Unsupported stage-pretrain input shape: {tuple(x.shape)}")
+
+            P = patches.size(1)
+            vp_counts = torch.full(
+                (B,),
+                fill_value=P,
+                dtype=torch.long,
+                device=patches.device,
+            )
+            if rel_time is None:
+                rel_time = torch.arange(
+                    P, device=patches.device, dtype=torch.float32,
+                ) * (c.patch_len / c.fs)
+                rel_time = rel_time.unsqueeze(0).expand(B, -1)
+
+            patches_a = patches.permute(0, 2, 1, 3)
+            if c.use_checkpoint and self.training:
+                h = checkpoint(
+                    lambda inp: self.backbone(inp, use_time_embed=False),
+                    patches_a,
+                    use_reentrant=False,
+                )
+            else:
+                h = self.backbone(patches_a, use_time_embed=False)
+
+            stage_logits = self.stage_head(h)
+            outputs = {
+                'stage_logits': stage_logits,
+                'stage_probs': torch.softmax(stage_logits, dim=-1),
+                'valid_patch_counts': vp_counts,
+                'seizure_relative_time': rel_time,
+            }
+            self._last = {
+                k: (v.detach() if isinstance(v, torch.Tensor) else v)
+                for k, v in outputs.items()
+            }
+            return outputs
+
         # ── Step 1: Seizure-aligned patching ──
         if seizure_onset_sec is None or window_start_sec is None:
             raise ValueError("SOZ mode requires seizure_onset_sec and window_start_sec")
@@ -912,10 +1009,19 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         patches, vp_counts_patched, rel_time_patched = self.patching(
             x, seizure_onset_sec, window_start_sec,
         )  # patches [B, P, 22, patch_len]
-        
-        vp_counts = valid_patch_counts if valid_patch_counts is not None else vp_counts_patched
+        patch_mask_patched = self.patching.get_valid_mask()
+        if valid_patch_mask is None:
+            valid_patch_mask = patch_mask_patched
+        if valid_patch_mask is None:
+            vp_counts = valid_patch_counts if valid_patch_counts is not None else vp_counts_patched
+            valid_patch_mask = self.net_evolution._build_valid_mask(vp_counts, patches.size(1))
+        valid_patch_mask = valid_patch_mask.to(device=patches.device, dtype=torch.bool)
+        vp_counts = valid_patch_mask.long().sum(dim=1)
         rel_time = rel_time if rel_time is not None else rel_time_patched
         P = patches.size(1)
+        node_valid_mask = valid_patch_mask[:, None, :].expand(
+            -1, c.n_channels, -1,
+        ).reshape(B, c.n_channels * P)
 
         # ── Branch A: Temporal (Lightweight Transformer + TimeFilter) ──
         patches_a = patches.permute(0, 2, 1, 3)              # [B, 22, P, patch_len]
@@ -923,7 +1029,11 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
             h = checkpoint(self.backbone, patches_a, use_reentrant=False)
         else:
             h = self.backbone(patches_a)                      # [B, N, D]  N=22*P
-        h, moe_loss_a = self.timefilter(h, is_training=self.training)  # [B, N, D]
+        h, moe_loss_a = self.timefilter(
+            h,
+            is_training=self.training,
+            node_valid_mask=node_valid_mask,
+        )  # [B, N, D]
         temporal_feat = h                                     # [B, N, D]
 
         # ── Branch B: Brain network + DirectedBrainTimeFilter ──
@@ -937,13 +1047,28 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
             device=brain_nets.device,
             dtype=brain_nets.dtype,
         )
+        brain_nets = brain_nets * valid_patch_mask.to(
+            device=brain_nets.device,
+            dtype=brain_nets.dtype,
+        )[:, :, None, None, None]
 
         # 有向图过滤
         brain_nets_filtered, moe_loss_b = self.brain_timefilter(
-            brain_nets, is_training=self.training,
+            brain_nets,
+            is_training=self.training,
+            valid_patch_mask=valid_patch_mask,
         )  # [B, P, 22, 22, 4], scalar
+        brain_nets_filtered = brain_nets_filtered * valid_patch_mask.to(
+            device=brain_nets_filtered.device,
+            dtype=brain_nets_filtered.dtype,
+        )[:, :, None, None, None]
 
-        evo_out = self.net_evolution(brain_nets_filtered, vp_counts, rel_time)
+        evo_out = self.net_evolution(
+            brain_nets_filtered,
+            vp_counts,
+            rel_time,
+            valid_patch_mask=valid_patch_mask,
+        )
         network_feat = evo_out['network_features']            # [B, 256]
         transition_probs = evo_out['transition_probs']        # [B, P]
         transition_logits = evo_out['transition_logits']      # [B, P]
@@ -955,7 +1080,10 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         # fused: [B, N, D],  gate_w: [B, N]
 
         # ── Step 4: SOZ localization ──
-        soz_logits, bipolar_logits = self.soz_head(fused)     # [B, 19], [B, 22]
+        soz_logits, bipolar_logits = self.soz_head(
+            fused,
+            patch_valid_mask=valid_patch_mask,
+        )                                                     # [B, 19], [B, 22]
         soz_probs = torch.sigmoid(soz_logits)
         # DeepSOZ-style aggregation from channel logits
         region_logits = self.region_agg(soz_logits)           # [B, n_regions]
@@ -980,6 +1108,7 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
             'brain_networks_filtered': brain_nets_filtered.detach(),
             'branch_weights': branch_weights,
             'valid_patch_counts': vp_counts,
+            'valid_patch_mask': valid_patch_mask,
             'seizure_relative_time': rel_time,
             'moe_loss': moe_loss,
         }
@@ -1103,6 +1232,32 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         losses['total'] = total
         return total, losses
 
+    def compute_stage_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        stage_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute patch-level seizure/non-seizure loss."""
+        losses: Dict[str, torch.Tensor] = {}
+        flat_targets = stage_targets.reshape(-1)
+        valid_mask = flat_targets != self.cfg.stage_ignore_index
+        if not valid_mask.any():
+            zero = outputs['stage_logits'].new_zeros(())
+            losses['stage'] = zero
+            losses['total'] = zero
+            return zero, losses
+
+        flat_logits = outputs['stage_logits'].reshape(-1, outputs['stage_logits'].size(-1))
+        losses['stage'] = self.stage_ce(flat_logits, flat_targets)
+        total = losses['stage']
+
+        if 'moe_loss' in outputs:
+            losses['moe'] = outputs['moe_loss']
+            total = total + self.cfg.w_moe * outputs['moe_loss']
+
+        losses['total'] = total
+        return total, losses
+
     # -----------------------------------------------------------------
     # Training phases
     # -----------------------------------------------------------------
@@ -1200,6 +1355,41 @@ class Lightweight_Transformer_BrainNetwork_Integration(nn.Module):
         if unexpected_keys:
             log.warning("Unexpected or mismatched keys in checkpoint: %s", unexpected_keys[:20])
         return model, ckpt
+
+    def load_backbone_weights(self, path: str, map_location='cpu') -> Dict[str, List[str]]:
+        """Load only lightweight Transformer backbone weights from a checkpoint."""
+        ckpt = torch.load(path, map_location=map_location)
+        state = ckpt.get('model_state', ckpt.get('state_dict', ckpt))
+        if not isinstance(state, dict):
+            raise KeyError("Checkpoint does not contain a valid model state dict")
+
+        backbone_state: Dict[str, torch.Tensor] = {}
+        for key, value in state.items():
+            clean_key = key[7:] if key.startswith('module.') else key
+            if clean_key.startswith('backbone.'):
+                if clean_key == 'backbone.time_embed':
+                    continue
+                backbone_state[clean_key] = value
+
+        own_state = self.state_dict()
+        loaded_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        for key, value in backbone_state.items():
+            if key not in own_state or own_state[key].shape != value.shape:
+                unexpected_keys.append(key)
+                continue
+            own_state[key].copy_(value)
+            loaded_keys.append(key)
+
+        missing_keys = [
+            key for key in own_state.keys()
+            if key.startswith('backbone.') and key not in backbone_state
+        ]
+        return {
+            'loaded_keys': sorted(loaded_keys),
+            'missing_keys': sorted(missing_keys),
+            'unexpected_keys': sorted(unexpected_keys),
+        }
 
     # -----------------------------------------------------------------
     # Interpretability

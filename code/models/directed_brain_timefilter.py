@@ -439,11 +439,16 @@ class DirectedBrainTimeFilter(nn.Module):
             raise ValueError("DirectedBrainTimeFilter requires at least one active feature")
         self.feature_active_mask.copy_(mask)
 
-    def forward(self, brain_networks: torch.Tensor,
-                is_training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        brain_networks: torch.Tensor,
+        is_training: bool = False,
+        valid_patch_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             brain_networks: [B, P, C, C, 4]
+            valid_patch_mask: optional [B, P] mask for valid patch slots
         Returns:
             filtered: [B, P, C, C, 4]  过滤后特征
             moe_loss: scalar  MoE辅助损失
@@ -469,10 +474,25 @@ class DirectedBrainTimeFilter(nn.Module):
         # 2. 时序注意力 (跨补丁维度)
         flat = filtered.reshape(B, P, -1)               # [B, P, C*C*4]
         flat_normed = self.temporal_norm(flat)
-        attn_out, _ = self.temporal_attn(flat_normed, flat_normed, flat_normed)
+        key_padding_mask = None
+        if valid_patch_mask is not None:
+            valid_patch_mask = valid_patch_mask.to(device=brain_networks.device, dtype=torch.bool)
+            safe_valid = valid_patch_mask.clone()
+            empty = ~safe_valid.any(dim=1)
+            if empty.any():
+                safe_valid[empty, 0] = True
+            key_padding_mask = ~safe_valid
+        attn_out, _ = self.temporal_attn(
+            flat_normed,
+            flat_normed,
+            flat_normed,
+            key_padding_mask=key_padding_mask,
+        )
         flat = flat + attn_out                            # 残差
         filtered = flat.reshape(B, P, C, C, F_)
         filtered = filtered * feature_mask.view(1, 1, 1, 1, F_)
+        if valid_patch_mask is not None:
+            filtered = filtered * valid_patch_mask.to(dtype=filtered.dtype)[:, :, None, None, None]
 
         # 3. MoE路由 (获取辅助损失)
         dummy_input = filtered.mean(dim=(2, 3))          # [B, P, 4]

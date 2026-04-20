@@ -383,6 +383,49 @@ class DynamicNetworkEvolutionModel(nn.Module):
         idx = torch.arange(max_len, device=valid_counts.device)
         return idx.unsqueeze(0) < valid_counts.unsqueeze(1)
 
+    @staticmethod
+    def _run_gru_with_valid_mask(
+        gru: nn.GRU,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run GRU only on exact valid slots, then scatter outputs back."""
+        B, P, F_ = x.shape
+        lengths = valid_mask.long().sum(dim=1)
+        max_len = int(lengths.max().item()) if lengths.numel() else 0
+        out_dim = gru.hidden_size * (2 if gru.bidirectional else 1)
+        out = x.new_zeros(B, P, out_dim)
+        if max_len <= 0:
+            return out
+
+        compact = x.new_zeros(B, max_len, F_)
+        valid_indices = []
+        for b in range(B):
+            idx = valid_mask[b].nonzero(as_tuple=False).flatten()
+            valid_indices.append(idx)
+            n = int(idx.numel())
+            if n > 0:
+                compact[b, :n] = x[b, idx]
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            compact,
+            lengths.clamp(min=1).cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_out, _ = gru(packed)
+        compact_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out,
+            batch_first=True,
+            total_length=max_len,
+        )
+
+        for b, idx in enumerate(valid_indices):
+            n = int(idx.numel())
+            if n > 0:
+                out[b, idx] = compact_out[b, :n]
+        return out
+
     # -----------------------------------------------------------------
     # forward
     # -----------------------------------------------------------------
@@ -392,13 +435,15 @@ class DynamicNetworkEvolutionModel(nn.Module):
         brain_networks: torch.Tensor,
         valid_patch_counts: torch.Tensor,
         seizure_relative_time: torch.Tensor,
+        valid_patch_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args
         ----
         brain_networks       : [B, P, 22, 22, 4]
-        valid_patch_counts   : [B]  (long)
+        valid_patch_counts   : [B]  (long), used when valid_patch_mask is absent
         seizure_relative_time: [B, P]
+        valid_patch_mask     : optional [B, P] exact valid slot mask
 
         Returns
         -------
@@ -410,7 +455,11 @@ class DynamicNetworkEvolutionModel(nn.Module):
         """
         B, P = brain_networks.shape[:2]
         dev = brain_networks.device
-        valid_mask = self._build_valid_mask(valid_patch_counts, P)  # [B, P]
+        if valid_patch_mask is not None:
+            valid_mask = valid_patch_mask.to(device=dev, dtype=torch.bool)
+            valid_patch_counts = valid_mask.long().sum(dim=1)
+        else:
+            valid_mask = self._build_valid_mask(valid_patch_counts, P)  # [B, P]
 
         # ── (a) Multi-branch snapshot encoding ──
         flat_nets = brain_networks.reshape(B * P, *brain_networks.shape[2:])
@@ -433,9 +482,14 @@ class DynamicNetworkEvolutionModel(nn.Module):
         snap = snap * valid_mask.unsqueeze(-1).float()
 
         # ── (b) BiGRU ──
-        gru_out = self._pack_and_run_gru(
-            self.gru, snap, valid_patch_counts,
-        )                                                    # [B, P, 256]
+        if valid_patch_mask is not None:
+            gru_out = self._run_gru_with_valid_mask(
+                self.gru, snap, valid_mask,
+            )
+        else:
+            gru_out = self._pack_and_run_gru(
+                self.gru, snap, valid_patch_counts,
+            )                                                # [B, P, 256]
         gru_out = gru_out * valid_mask.unsqueeze(-1).float()
 
         # ── (c) Transition detection ──
@@ -511,9 +565,14 @@ class DynamicNetworkEvolutionModel(nn.Module):
         tt = (seizure_relative_time.abs() <= onset_half_width).float()
         tt = tt * valid_mask.float()
 
-        # Pattern: determine dominant phase from median relative time
-        # (simplified heuristic for self-test / curriculum pre-training)
-        med = seizure_relative_time.median(dim=1).values      # [B]
+        # Pattern: determine dominant phase from valid relative times only.
+        med_values = []
+        for b in range(seizure_relative_time.size(0)):
+            vals = seizure_relative_time[b][valid_mask[b]]
+            if vals.numel() == 0:
+                vals = seizure_relative_time[b]
+            med_values.append(vals.median())
+        med = torch.stack(med_values, dim=0)                  # [B]
         pattern = torch.where(
             med < -1.0,
             torch.zeros_like(med).long(),                     # baseline
