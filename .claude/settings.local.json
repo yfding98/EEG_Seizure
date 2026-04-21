@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from code.baseline.model import SimpleCNN; import torch; m = SimpleCNN\\(task='detection'\\); x = torch.randn\\(2,22,2000\\); print\\('detection output:', m\\(x\\).shape\\); m2 = SimpleCNN\\(task='soz'\\); print\\('soz output:', m2\\(x\\).shape\\); print\\('params:', sum\\(p.numel\\(\\) for p in m.parameters\\(\\)\\)\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
