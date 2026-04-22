@@ -291,6 +291,17 @@ def main(args):
             auc = test_metrics["per_channel_auc"][i]
             print(f'    {a}-{c:3s}: {auc:.4f}')
 
+    # ── DeepSOZ-style evaluation for SOZ task ──
+    if args.task == 'soz':
+        from baseline.evaluate import evaluate_soz
+        eval_ds = TUSZBaselineDataset(
+            args.data_dir, 'eval', task='soz', return_meta=True,
+        )
+        eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.workers, pin_memory=True)
+        evaluate_soz(model, eval_loader, device,
+                     output_dir=run_dir, mc_samples=args.mc_samples)
+
     # ── Save results ──
     results = {
         'task': args.task,
@@ -321,4 +332,6 @@ if __name__ == '__main__':
     p.add_argument('--patience', type=int, default=10)
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--mc_samples', type=int, default=20,
+                   help='MC dropout samples for SOZ evaluation (default: 20)')
     main(p.parse_args())
