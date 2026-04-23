@@ -16,9 +16,14 @@ Usage:
 import argparse
 import csv
 import os
+import sys
 import traceback
 from collections import defaultdict
 from pathlib import Path
+
+_CODE_DIR = str(Path(__file__).resolve().parent.parent)
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
 
 import mne
 import numpy as np
