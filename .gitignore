@@ -1,0 +1,41 @@
+# ── Ignore seizure_code directory ──
+seizure_code/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ──
+venv/
+.venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Training outputs ──
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# ── Data ──
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.edf
+*.set
+*.fdt
