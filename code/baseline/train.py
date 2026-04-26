@@ -36,7 +36,15 @@ from sklearn.metrics import (
 )
 
 from baseline.dataset import TUSZBaselineDataset
-from baseline.model import SimpleCNN
+from baseline.model import (
+    MonopolarEEGNetRegionCNN,
+    MonopolarRegionCNN,
+    MonopolarSeparableRegionCNN,
+    MonopolarSharedAttentionRegionCNN,
+    RegionCNN,
+    SimpleCNN,
+)
+from baseline.regions import MONOPOLAR_CHANNELS_TUSZ17, REGION_NAMES
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -53,6 +61,23 @@ def get_device():
     if torch.cuda.is_available():
         return torch.device('cuda')
     return torch.device('cpu')
+
+
+def build_region_model(input_mode='bipolar', region_model='standard'):
+    if input_mode == 'bipolar':
+        if region_model != 'standard':
+            raise ValueError('Bipolar region mode currently supports only region_model=standard')
+        return RegionCNN()
+
+    if region_model == 'standard':
+        return MonopolarRegionCNN()
+    if region_model == 'separable':
+        return MonopolarSeparableRegionCNN()
+    if region_model == 'shared_attention':
+        return MonopolarSharedAttentionRegionCNN(n_channels=len(MONOPOLAR_CHANNELS_TUSZ17))
+    if region_model == 'eegnet':
+        return MonopolarEEGNetRegionCNN()
+    raise ValueError(f'Unknown region_model: {region_model}')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -136,22 +161,22 @@ def compute_metrics(probs, labels, task):
         m['sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         return m
     else:
-        # SOZ: per-channel and mean metrics
+        # SOZ: per-channel or per-region multi-label metrics
         preds = (probs >= 0.5).astype(int)
         labels_int = labels.astype(int)
-        n_channels = probs.shape[1]
+        n_outputs = probs.shape[1]
 
-        per_ch_auc = []
-        for ch in range(n_channels):
+        per_output_auc = []
+        for ch in range(n_outputs):
             try:
                 auc = roc_auc_score(labels_int[:, ch], probs[:, ch])
             except ValueError:
                 auc = 0.0
-            per_ch_auc.append(auc)
+            per_output_auc.append(auc)
 
         m = {
-            'mean_auc': np.mean(per_ch_auc),
-            'per_channel_auc': per_ch_auc,
+            'mean_auc': np.mean(per_output_auc),
+            'per_channel_auc': per_output_auc,
             'f1_micro': f1_score(labels_int.ravel(), preds.ravel(), zero_division=0),
             'f1_macro': f1_score(labels_int, preds, average='macro', zero_division=0),
             'accuracy': accuracy_score(labels_int.ravel(), preds.ravel()),
@@ -173,11 +198,22 @@ def main(args):
     device = get_device()
     print(f'Device: {device}')
     print(f'Task: {args.task}')
+    if args.input_mode == 'monopolar' and args.task != 'soz_region':
+        raise ValueError('input_mode=monopolar is currently implemented for --task soz_region only')
 
     # ── Data ──
-    train_ds = TUSZBaselineDataset(args.data_dir, 'train', task=args.task)
-    val_ds   = TUSZBaselineDataset(args.data_dir, 'dev',   task=args.task)
-    test_ds  = TUSZBaselineDataset(args.data_dir, 'eval',  task=args.task)
+    train_ds = TUSZBaselineDataset(
+        args.data_dir, 'train', task=args.task, input_mode=args.input_mode,
+        allow_bipolar_fallback=args.allow_bipolar_fallback,
+    )
+    val_ds = TUSZBaselineDataset(
+        args.data_dir, 'dev', task=args.task, input_mode=args.input_mode,
+        allow_bipolar_fallback=args.allow_bipolar_fallback,
+    )
+    test_ds = TUSZBaselineDataset(
+        args.data_dir, 'eval', task=args.task, input_mode=args.input_mode,
+        allow_bipolar_fallback=args.allow_bipolar_fallback,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -187,7 +223,14 @@ def main(args):
                               num_workers=args.workers, pin_memory=True)
 
     # ── Model ──
-    model = SimpleCNN(n_channels=22, task=args.task).to(device)
+    if args.task == 'soz_region':
+        model = build_region_model(args.input_mode, args.region_model).to(device)
+        print(f'Region outputs: {", ".join(REGION_NAMES)}')
+        print(f'Input mode: {args.input_mode}, region_model: {args.region_model}')
+        if args.input_mode == 'monopolar':
+            print(f'Monopolar inputs: {", ".join(MONOPOLAR_CHANNELS_TUSZ17)}')
+    else:
+        model = SimpleCNN(n_channels=22, task=args.task).to(device)
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model parameters: {param_count:,}')
 
@@ -285,11 +328,17 @@ def main(args):
         print(f'  F1 (micro):      {test_metrics["f1_micro"]:.4f}')
         print(f'  F1 (macro):      {test_metrics["f1_macro"]:.4f}')
         print(f'  Sample Accuracy: {test_metrics["sample_accuracy"]:.4f}')
-        print(f'\n  Per-channel AUC:')
-        from baseline.preprocess_tusz import TCP_PAIRS
-        for i, (a, c) in enumerate(TCP_PAIRS):
-            auc = test_metrics["per_channel_auc"][i]
-            print(f'    {a}-{c:3s}: {auc:.4f}')
+        if args.task == 'soz_region':
+            print(f'\n  Per-region AUC:')
+            for i, name in enumerate(REGION_NAMES):
+                auc = test_metrics["per_channel_auc"][i]
+                print(f'    {name:15s}: {auc:.4f}')
+        else:
+            print(f'\n  Per-channel AUC:')
+            from baseline.preprocess_tusz import TCP_PAIRS
+            for i, (a, c) in enumerate(TCP_PAIRS):
+                auc = test_metrics["per_channel_auc"][i]
+                print(f'    {a}-{c:3s}: {auc:.4f}')
 
     # ── DeepSOZ-style evaluation for SOZ task ──
     if args.task == 'soz':
@@ -322,7 +371,8 @@ def main(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Baseline CNN Training')
-    p.add_argument('--task', type=str, default='detection', choices=['detection', 'soz'])
+    p.add_argument('--task', type=str, default='detection',
+                   choices=['detection', 'soz', 'soz_region'])
     p.add_argument('--data_dir', type=str, default=r'F:\process_dataset\baseline')
     p.add_argument('--output_dir', type=str, default='runs/baseline')
     p.add_argument('--batch_size', type=int, default=64)
@@ -334,4 +384,12 @@ if __name__ == '__main__':
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--mc_samples', type=int, default=20,
                    help='MC dropout samples for SOZ evaluation (default: 20)')
+    p.add_argument('--input_mode', type=str, default='bipolar',
+                   choices=['bipolar', 'monopolar'],
+                   help='Input channel space for region SOZ models')
+    p.add_argument('--region_model', type=str, default='standard',
+                   choices=['standard', 'separable', 'shared_attention', 'eegnet'],
+                   help='Region SOZ model variant')
+    p.add_argument('--allow_bipolar_fallback', action='store_true',
+                   help='When input_mode=monopolar, approximate monopolar signals from 22 bipolar eeg_data if no monopolar_data exists')
     main(p.parse_args())

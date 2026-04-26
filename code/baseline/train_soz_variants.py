@@ -40,7 +40,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset
 
 from baseline.dataset import TUSZBaselineDataset
-from baseline.model import SimpleCNN
+from baseline.model import (
+    MonopolarEEGNetRegionCNN,
+    MonopolarRegionCNN,
+    MonopolarSeparableRegionCNN,
+    MonopolarSharedAttentionRegionCNN,
+    RegionCNN,
+    SimpleCNN,
+)
+from baseline.regions import MONOPOLAR_CHANNELS_TUSZ17, REGION_NAMES
 from baseline.train import (
     set_seed, get_device, train_one_epoch, evaluate, compute_metrics,
 )
@@ -50,57 +58,61 @@ from baseline.train import (
 # Dataset building
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _try_load(data_dir, split, task, return_meta=False):
+def _try_load(data_dir, split, task, return_meta=False, input_mode='bipolar',
+              allow_bipolar_fallback=True):
     """Load dataset, return None if split dir is empty or missing."""
     split_dir = os.path.join(data_dir, split)
     if not os.path.isdir(split_dir):
         return None
     try:
-        return TUSZBaselineDataset(data_dir, split, task=task, return_meta=return_meta)
+        return TUSZBaselineDataset(
+            data_dir, split, task=task, return_meta=return_meta,
+            input_mode=input_mode,
+            allow_bipolar_fallback=allow_bipolar_fallback,
+        )
     except FileNotFoundError:
         return None
 
 
-def build_datasets(source, tusz_dir, private_dir, return_meta=False):
+def build_datasets(source, tusz_dir, private_dir, return_meta=False, task='soz',
+                   input_mode='bipolar', allow_bipolar_fallback=True):
     """
     Build train/val/test datasets according to source mode.
 
     Returns:
         train_ds, val_ds, test_ds, test_label (str describing test set origin)
     """
-    task = 'soz'
-
     if source == 'private':
-        train_ds = _try_load(private_dir, 'train', task, return_meta)
-        val_ds   = _try_load(private_dir, 'val',   task, return_meta)
-        test_ds  = _try_load(private_dir, 'test',  task, return_meta)
+        train_ds = _try_load(private_dir, 'train', task, return_meta, input_mode, allow_bipolar_fallback)
+        val_ds   = _try_load(private_dir, 'val',   task, return_meta, input_mode, allow_bipolar_fallback)
+        test_ds  = _try_load(private_dir, 'test',  task, return_meta, input_mode, allow_bipolar_fallback)
         test_label = 'private-test'
 
     elif source == 'tusz':
-        train_ds = _try_load(tusz_dir, 'train', task, return_meta)
-        val_ds   = _try_load(tusz_dir, 'dev',   task, return_meta)
-        test_ds  = _try_load(tusz_dir, 'eval',  task, return_meta)
+        train_ds = _try_load(tusz_dir, 'train', task, return_meta, input_mode, allow_bipolar_fallback)
+        val_ds   = _try_load(tusz_dir, 'dev',   task, return_meta, input_mode, allow_bipolar_fallback)
+        test_ds  = _try_load(tusz_dir, 'eval',  task, return_meta, input_mode, allow_bipolar_fallback)
         test_label = 'tusz-eval'
 
     elif source == 'combined':
         # Train: TUSZ train + private train
         parts_train = []
-        t = _try_load(tusz_dir, 'train', task, return_meta)
+        t = _try_load(tusz_dir, 'train', task, return_meta, input_mode, allow_bipolar_fallback)
         if t: parts_train.append(t)
-        p = _try_load(private_dir, 'train', task, return_meta)
+        p = _try_load(private_dir, 'train', task, return_meta, input_mode, allow_bipolar_fallback)
         if p: parts_train.append(p)
         train_ds = ConcatDataset(parts_train) if len(parts_train) > 1 else (parts_train[0] if parts_train else None)
 
         # Val: TUSZ dev + private val
         parts_val = []
-        t = _try_load(tusz_dir, 'dev', task, return_meta)
+        t = _try_load(tusz_dir, 'dev', task, return_meta, input_mode, allow_bipolar_fallback)
         if t: parts_val.append(t)
-        p = _try_load(private_dir, 'val', task, return_meta)
+        p = _try_load(private_dir, 'val', task, return_meta, input_mode, allow_bipolar_fallback)
         if p: parts_val.append(p)
         val_ds = ConcatDataset(parts_val) if len(parts_val) > 1 else (parts_val[0] if parts_val else None)
 
         # Test: private test (main interest)
-        test_ds = _try_load(private_dir, 'test', task, return_meta)
+        test_ds = _try_load(private_dir, 'test', task, return_meta, input_mode, allow_bipolar_fallback)
         test_label = 'private-test'
     else:
         raise ValueError(f'Unknown source: {source}')
@@ -112,6 +124,22 @@ def build_datasets(source, tusz_dir, private_dir, return_meta=False):
     return train_ds, val_ds, test_ds, test_label
 
 
+def build_region_model(input_mode='bipolar', region_model='standard'):
+    if input_mode == 'bipolar':
+        if region_model != 'standard':
+            raise ValueError('Bipolar region mode currently supports only region_model=standard')
+        return RegionCNN()
+    if region_model == 'standard':
+        return MonopolarRegionCNN()
+    if region_model == 'separable':
+        return MonopolarSeparableRegionCNN()
+    if region_model == 'shared_attention':
+        return MonopolarSharedAttentionRegionCNN(n_channels=len(MONOPOLAR_CHANNELS_TUSZ17))
+    if region_model == 'eegnet':
+        return MonopolarEEGNetRegionCNN()
+    raise ValueError(f'Unknown region_model: {region_model}')
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -121,10 +149,15 @@ def main(args):
     device = get_device()
     print(f'Device: {device}')
     print(f'Source: {args.source}')
+    if args.input_mode == 'monopolar' and not args.region_level:
+        raise ValueError('input_mode=monopolar is currently implemented with --region_level')
 
     # ── Data ──
+    task = 'soz_region' if args.region_level else 'soz'
     train_ds, val_ds, test_ds, test_label = build_datasets(
-        args.source, args.tusz_dir, args.private_dir,
+        args.source, args.tusz_dir, args.private_dir, task=task,
+        input_mode=args.input_mode,
+        allow_bipolar_fallback=args.allow_bipolar_fallback,
     )
     print(f'Train: {len(train_ds)} samples')
     print(f'Val:   {len(val_ds)} samples')
@@ -138,7 +171,14 @@ def main(args):
                               num_workers=args.workers, pin_memory=True)
 
     # ── Model ──
-    model = SimpleCNN(n_channels=22, task='soz').to(device)
+    if args.region_level:
+        model = build_region_model(args.input_mode, args.region_model).to(device)
+        print(f'Region outputs: {", ".join(REGION_NAMES)}')
+        print(f'Input mode: {args.input_mode}, region_model: {args.region_model}')
+        if args.input_mode == 'monopolar':
+            print(f'Monopolar inputs: {", ".join(MONOPOLAR_CHANNELS_TUSZ17)}')
+    else:
+        model = SimpleCNN(n_channels=22, task='soz').to(device)
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model parameters: {param_count:,}')
 
@@ -153,17 +193,17 @@ def main(args):
 
     # ── Output dir ──
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join(args.output_dir, f'soz_{args.source}_{timestamp}')
+    run_prefix = f'soz_region_{args.region_model}' if args.region_level else 'soz'
+    run_dir = os.path.join(args.output_dir, f'{run_prefix}_{args.source}_{timestamp}')
     os.makedirs(run_dir, exist_ok=True)
 
     # ── Training loop ──
     best_val_loss = float('inf')
     patience_counter = 0
     history = []
-    task = 'soz'
-
     print(f'\n{"="*60}')
-    print(f'Training SOZ ({args.source}) for {args.epochs} epochs (patience={args.patience})')
+    level = 'region SOZ' if args.region_level else 'channel SOZ'
+    print(f'Training {level} ({args.source}) for {args.epochs} epochs (patience={args.patience})')
     print(f'{"="*60}\n')
 
     for epoch in range(1, args.epochs + 1):
@@ -210,34 +250,43 @@ def main(args):
     print(f'  F1 (micro):      {test_metrics["f1_micro"]:.4f}')
     print(f'  F1 (macro):      {test_metrics["f1_macro"]:.4f}')
     print(f'  Sample Accuracy: {test_metrics["sample_accuracy"]:.4f}')
-    print(f'\n  Per-channel AUC:')
-    from baseline.preprocess_tusz import TCP_PAIRS
-    for i, (a, c) in enumerate(TCP_PAIRS):
-        auc = test_metrics["per_channel_auc"][i]
-        print(f'    {a}-{c:3s}: {auc:.4f}')
+    if args.region_level:
+        print(f'\n  Per-region AUC:')
+        for i, name in enumerate(REGION_NAMES):
+            auc = test_metrics["per_channel_auc"][i]
+            print(f'    {name:15s}: {auc:.4f}')
+    else:
+        print(f'\n  Per-channel AUC:')
+        from baseline.preprocess_tusz import TCP_PAIRS
+        for i, (a, c) in enumerate(TCP_PAIRS):
+            auc = test_metrics["per_channel_auc"][i]
+            print(f'    {a}-{c:3s}: {auc:.4f}')
 
     # ── DeepSOZ-style evaluation ──
-    from baseline.evaluate import evaluate_soz
+    if not args.region_level:
+        from baseline.evaluate import evaluate_soz
 
-    # Primary test set
-    test_ds_meta = build_datasets(
-        args.source, args.tusz_dir, args.private_dir, return_meta=True,
-    )[2]
-    test_loader_meta = DataLoader(test_ds_meta, batch_size=args.batch_size, shuffle=False,
-                                  num_workers=args.workers, pin_memory=True)
-    evaluate_soz(model, test_loader_meta, device,
-                 output_dir=run_dir, mc_samples=args.mc_samples)
+        # Primary test set
+        test_ds_meta = build_datasets(
+            args.source, args.tusz_dir, args.private_dir, return_meta=True, task=task,
+            input_mode=args.input_mode,
+            allow_bipolar_fallback=args.allow_bipolar_fallback,
+        )[2]
+        test_loader_meta = DataLoader(test_ds_meta, batch_size=args.batch_size, shuffle=False,
+                                      num_workers=args.workers, pin_memory=True)
+        evaluate_soz(model, test_loader_meta, device,
+                     output_dir=run_dir, mc_samples=args.mc_samples)
 
-    # For combined mode: also evaluate on TUSZ eval for cross-dataset comparison
-    if args.source == 'combined':
-        tusz_eval = _try_load(args.tusz_dir, 'eval', 'soz', return_meta=True)
-        if tusz_eval is not None:
-            print(f'\n--- Additional: TUSZ eval set ---')
-            tusz_eval_loader = DataLoader(tusz_eval, batch_size=args.batch_size, shuffle=False,
-                                          num_workers=args.workers, pin_memory=True)
-            tusz_eval_dir = os.path.join(run_dir, 'tusz_eval')
-            evaluate_soz(model, tusz_eval_loader, device,
-                         output_dir=tusz_eval_dir, mc_samples=args.mc_samples)
+        # For combined mode: also evaluate on TUSZ eval for cross-dataset comparison
+        if args.source == 'combined':
+            tusz_eval = _try_load(args.tusz_dir, 'eval', 'soz', return_meta=True)
+            if tusz_eval is not None:
+                print(f'\n--- Additional: TUSZ eval set ---')
+                tusz_eval_loader = DataLoader(tusz_eval, batch_size=args.batch_size, shuffle=False,
+                                              num_workers=args.workers, pin_memory=True)
+                tusz_eval_dir = os.path.join(run_dir, 'tusz_eval')
+                evaluate_soz(model, tusz_eval_loader, device,
+                             output_dir=tusz_eval_dir, mc_samples=args.mc_samples)
 
     # ── Save results ──
     results = {
@@ -277,4 +326,14 @@ if __name__ == '__main__':
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--mc_samples', type=int, default=20,
                    help='MC dropout samples for DeepSOZ evaluation')
+    p.add_argument('--region_level', action='store_true',
+                   help='Train variable-channel region CNN with 5 brain-region SOZ outputs')
+    p.add_argument('--input_mode', type=str, default='bipolar',
+                   choices=['bipolar', 'monopolar'],
+                   help='Input channel space for region SOZ models')
+    p.add_argument('--region_model', type=str, default='standard',
+                   choices=['standard', 'separable', 'shared_attention', 'eegnet'],
+                   help='Region model variant for --region_level')
+    p.add_argument('--allow_bipolar_fallback', action='store_true',
+                   help='When input_mode=monopolar, approximate monopolar signals from 22 bipolar eeg_data if no monopolar_data exists')
     main(p.parse_args())

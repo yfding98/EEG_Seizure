@@ -39,3 +39,9 @@ runs/
 *.edf
 *.set
 *.fdt
+
+# -- OpenAI API keys and logs --
+.codex
+.claude/
+
+output/
