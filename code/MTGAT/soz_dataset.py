@@ -7,6 +7,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -27,18 +28,146 @@ class WindowIndex:
     is_seizure: int
 
 
+_ANNOTATION_WARNING_REPORTED: set[tuple[str, str]] = set()
+
+
+def _read_original_edf_annotations(raw, encoding: str):
+    """Re-read EDF TAL annotations before MNE crops them to the data range."""
+    try:
+        from mne.io.edf.edf import _read_annotations_edf
+
+        edf_info = raw._raw_extras[0]
+        tal_idx = edf_info.get("tal_idx", [])
+        if len(tal_idx) == 0:
+            return None
+
+        idx = np.empty(0, int)
+        tal_data = raw._read_segment_file(
+            np.empty((0, raw.n_times)),
+            idx,
+            0,
+            0,
+            int(raw.n_times),
+            np.ones((len(idx), 1)),
+            None,
+        )
+        return _read_annotations_edf(
+            tal_data[0],
+            ch_names=raw.info["ch_names"],
+            encoding=encoding,
+        )
+    except Exception as exc:  # pragma: no cover - depends on MNE/private EDF internals
+        print(
+            f"[MTGAT][EDF annotation warning] Could not inspect original EDF "
+            f"annotations: {exc}",
+            flush=True,
+        )
+        return None
+
+
+def _print_out_of_range_annotation_details(
+    raw,
+    edf_path: Path,
+    encoding: str,
+    warning_message: str,
+    max_items: int = 50,
+) -> None:
+    """Print file and annotation rows responsible for MNE outside-range warnings."""
+    key = (str(edf_path), warning_message)
+    if key in _ANNOTATION_WARNING_REPORTED:
+        return
+    _ANNOTATION_WARNING_REPORTED.add(key)
+
+    data_start = 0.0
+    data_stop = float(raw.times[-1] + 1.0 / raw.info["sfreq"])
+    print(
+        f"[MTGAT][EDF annotation warning] {edf_path}\n"
+        f"  MNE warning: {warning_message}\n"
+        f"  data_range_sec=[{data_start:.6f}, {data_stop:.6f}], "
+        f"sfreq={float(raw.info['sfreq']):.6f}, n_times={raw.n_times}, "
+        f"encoding={encoding}",
+        flush=True,
+    )
+
+    annotations = _read_original_edf_annotations(raw, encoding)
+    if annotations is None:
+        print("  Could not recover the original annotation rows.", flush=True)
+        return
+
+    omitted = []
+    for idx, (onset, duration, description, ch_names) in enumerate(
+        zip(
+            annotations.onset,
+            annotations.duration,
+            annotations.description,
+            annotations.ch_names,
+        )
+    ):
+        duration = 0.0 if np.isnan(duration) else float(duration)
+        onset = float(onset)
+        end = onset + duration
+        if onset > data_stop or end < data_start:
+            omitted.append((idx, onset, duration, end, str(description), ch_names))
+
+    if not omitted:
+        print(
+            "  Original annotations were parsed, but no out-of-range rows were "
+            "found with the current MNE crop rule.",
+            flush=True,
+        )
+        return
+
+    print(f"  out_of_range_annotations={len(omitted)}", flush=True)
+    for local_idx, item in enumerate(omitted[:max_items]):
+        idx, onset, duration, end, description, ch_names = item
+        ch_text = ",".join(ch_names) if ch_names else ""
+        print(
+            f"    [{local_idx:03d}] original_idx={idx}, "
+            f"onset={onset:.6f}s, duration={duration:.6f}s, "
+            f"end={end:.6f}s, description={description!r}, "
+            f"ch_names={ch_text!r}",
+            flush=True,
+        )
+    if len(omitted) > max_items:
+        print(
+            f"    ... truncated {len(omitted) - max_items} more annotation(s)",
+            flush=True,
+        )
+
+
 def _read_raw_edf(edf_path: Path):
     import mne
 
     last_error = None
     for encoding in ("utf-8", "latin-1"):
         try:
-            return mne.io.read_raw_edf(
-                str(edf_path),
-                preload=True,
-                verbose=False,
-                encoding=encoding,
-            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                raw = mne.io.read_raw_edf(
+                    str(edf_path),
+                    preload=True,
+                    verbose=False,
+                    encoding=encoding,
+                )
+            for warning_item in caught:
+                message = str(warning_item.message)
+                if (
+                    warning_item.category is RuntimeWarning
+                    and "annotation(s) that were outside data range" in message
+                ):
+                    _print_out_of_range_annotation_details(
+                        raw,
+                        edf_path,
+                        encoding,
+                        message,
+                    )
+                else:
+                    warnings.warn(
+                        warning_item.message,
+                        warning_item.category,
+                        stacklevel=2,
+                    )
+            return raw
         except Exception as exc:  # pragma: no cover - depends on local EDFs
             last_error = exc
     raise RuntimeError(f"Could not read EDF {edf_path}: {last_error}")
@@ -274,4 +403,3 @@ def collate_soz_batch(batch: List[Dict[str, object]]) -> Dict[str, object]:
         "event_id": [m["event_id"] for m in metas],
         "patient_id": [m["patient_id"] for m in metas],
     }
-
