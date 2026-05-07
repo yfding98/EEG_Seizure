@@ -45,3 +45,4 @@ runs/
 .claude/
 
 output/
+*__pycache__
